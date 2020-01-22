@@ -30,15 +30,11 @@ if (!defined('EXTENDED'))
 // In case AC is not defined in config.php, default to 0
 if (!defined('AC'))
   define('AC', 0);
-if (!defined('VERBOSE'))
-  define('VERBOSE', 0);
 
 /*
  * Report a message
  */
-function report($msg, $err = false) {
-  if (!$err && !VERBOSE)
-    return;
+function report($msg) {
   echo date('Ymd-H:i:s') . ' ' . $msg . PHP_EOL;
 }
 
@@ -46,7 +42,7 @@ function report($msg, $err = false) {
  * Fatal error, likely a configuration issue
  */
 function fatal($msg) {
-  report($msg . ': ' . socket_strerror(socket_last_error()), true);
+  report($msg . ': ' . socket_strerror(socket_last_error()));
   exit(1);
 }
 
@@ -56,6 +52,44 @@ function fatal($msg) {
 $total = array();
 // When did we last send to PVOUtput?
 $last = 0;
+// When did we last send a reply back to the gateway?
+$lastkeepalive = 0;
+
+/* 
+ * Update openhab
+ */
+function submit_openhab($values) {
+  // Prepare PUT to OpenHab
+  $headers = "Content-type: text/plain\r\nAccept: application/json\r\n";
+  $url = "http://" . OPENHABHOST . ":" . OPENHABPORT . "/rest/items/". OPENHABITEM . "/state";
+  //report("PUTting to Openhab => ". $url);
+  
+  $data = json_encode($values);
+  $ctx = array('http' => array(
+    'method' => 'PUT',
+    'header' => $headers,
+    'content' => $data));
+  $context = stream_context_create($ctx);
+  //report("Openhab => ". $data);
+
+  set_error_handler(function($errno, $errstr, $errfile, $errline, $errcontext) {
+      // error was suppressed with the @-operator
+      if (0 === error_reporting()) {
+          return false;
+      }
+
+      report('Error opening connection to OpenHab: ' . $errstr);
+  }, E_WARNING);
+  $fp = fopen($url, 'r', false, $context);
+  restore_error_handler();
+  if (!$fp)
+    report('PUT failed, check OpenHab');
+  else {
+    $reply = fread($fp, 100);
+    //report('<= OpenHab ' . $reply);
+    fclose($fp);
+  }
+}
 
 /*
  * Compute aggregate info to send to PVOutput
@@ -143,7 +177,7 @@ function submit($total, $systemid, $apikey) {
   $fp = fopen($url, 'r', false, $context);
   if (!$fp)
     report('POST failed, check your APIKEY=' . $apikey . ' and SYSTEMID=' .
-      $systemid, true);
+      $systemid);
   else {
     $reply = fread($fp, 100);
     report('<= PVOutput ' . $reply);
@@ -167,6 +201,33 @@ function submit($total, $systemid, $apikey) {
 }
 
 
+/*
+ * Read data from socket until a "\r" is seen
+ */
+$buf = '';
+function reader($socket) {
+  global $buf;
+  $last_read = time();
+  while (true) {
+    $pos = strpos($buf, "\r");
+    if ($pos === false) {
+      $ret = @socket_recv($socket, $str, 128, 0);
+      if ($ret === false || $ret == 0) {
+        if ($last_read <= time() - 90)
+          return false;
+        sleep(3);
+        continue;
+      }
+      $last_read = time();
+      $buf .= $str;
+      continue;
+    } else {
+      $str = substr($buf, 0, $pos + 1);
+      $buf = substr($buf, $pos + 2);
+      return $str;
+    }
+  }
+}
 
 /*
  * Submit data to MySQL
@@ -175,17 +236,12 @@ $link = false;
 function submit_mysql($v, $LifeWh) {
   global $link;
 
-  // mysqli.reconnect is false by default
-  if (is_resource($link) && !mysqli_ping($link)) {
-    mysqli_close($link);
-    $link = false;
-  }
   if (!$link) {
     $link = mysqli_connect(MYSQLHOST, MYSQLUSER, MYSQLPASSWORD, MYSQLDB,
       MYSQLPORT);
   }
   if (!$link) {
-    report('Cannot connect to MySQL ' . mysqli_connect_error(), true);
+    report('Cannot connect to MySQL ' . mysqli_connect_error());
     return;
   }
 
@@ -204,30 +260,30 @@ function submit_mysql($v, $LifeWh) {
     mysqli_real_escape_string($link, $v['State']));
 
   if (!mysqli_query($link, $q)) {
-   report('MySQL insert failed: ' . mysqli_error($link), true);
+   report('MySQL insert failed: ' . mysqli_error($link));
    mysqli_close($link);
    $link = false;
   }
 }
 
 /*
- * Loop processing lines from the gatway
+ * Loop processing lines from the gateway
  */
-function process(Connection $conn) {
-  global $total, $last, $systemid, $apikey, $ignored;
+function process($socket) {
+  global $total, $last, $lastkeepalive, $systemid, $apikey, $ignored;
 
   while (true) {
-    $str = $conn->getline();
+    $str = reader($socket);
     if ($str === false) {
         return;
     }
     // Send a reply if the last reply is 200 seconds ago
-    if ($conn->lastkeepalive < time() - 200) {
+    if ($lastkeepalive < time() - 200) {
       //echo 'write' . PHP_EOL;
-      if (socket_write($conn->socket, "0E0000000000cgAD83\r") === false)
+      if (socket_write($socket, "0E0000000000cgAD83\r") === false)
         return;
       //echo 'write done' . PHP_EOL;
-      $conn->lastkeepalive = time();
+      $lastkeepalive = time();
     }
     $str = str_replace(array("\n", "\r"), "", $str);
     //report($str);
@@ -268,8 +324,7 @@ function process(Connection $conn) {
         if ($total[$key]['TS'] < $time - 3600)
           unset($total[$key]);
       }
-      
-      $oldcount = count($total);
+
       // Record in $total indexed by id: cummulative energy
       $total[$id]['Energy'] = $LifeWh;
       // Record in $total, indexed by id: count, last 10 power values
@@ -285,36 +340,38 @@ function process(Connection $conn) {
       $total[$id]['Temperature'] = $v['Temperature'];
       $total[$id]['State'] = $v['State'];
 
-      if (VERBOSE)
-        printf('%s DC=%3dW %5.2fV %4.2fA AC=%3dV %6.2fW E=%4.2f T=%2d ' .
-          'S=%d L=%.3fkWh' .  PHP_EOL,
-          $id, $v['DCPower'], $DCVolt, $v['DCCurrent'],
-          $v['ACVolt'], $ACPower,
-          $v['Efficiency'], $v['Temperature'], $v['State'],
-          $LifeWh / 1000);
+      printf('%s DC=%3dW %5.2fV %4.2fA AC=%3dV %6.2fW E=%4.2f T=%2d ' .
+        'S=%d L=%.3fkWh' .  PHP_EOL,
+        $id, $v['DCPower'], $DCVolt, $v['DCCurrent'],
+        $v['ACVolt'], $ACPower,
+        $v['Efficiency'], $v['Temperature'], $v['State'],
+        $LifeWh / 1000);
+
+      // Prepare array for Openhab update
+      if (defined('OPENHABHOST')) {
+        $oh_value = array( 'id' => $id, 'DCPower' => $v['DCPower'], 'DCVolt' => $DCVolt, 
+          'DCCurrent' => $v['DCCurrent'], 'ACVolt' => $v['ACVolt'], 'ACPower' => $ACPower,
+          'Efficiency' => $v['Efficiency'], 'Temperature' => $v['Temperature'], 
+          'State' => $v['State'], 'LifekWh' => $LifeWh / 1000);
+        submit_openhab($oh_value);
+      }
 
       if (defined('MYSQLDB'))
         submit_mysql($v, $LifeWh);
 
-      $min = idate('i') % 10;
       if (MODE == 'SPLIT') {
         // time to report for this inverter?
-        if (!isset($total[$id]['TS']) ||
-          ($total[$id]['TS'] < $time - 300 && $min < 5)) {
+        if (!isset($total[$id]['TS']) || $total[$id]['TS'] < $time - 540) {
           $key = isset($apikey[$id]) ? $apikey[$id] : APIKEY;
           submit(array($total[$id]), $systemid[$id], $key);
           $total[$id]['TS'] = $time;
         }
       } 
-
-      if ($oldcount == IDCOUNT - 1 && count($total) == IDCOUNT)
-        report('Seen all expected ' . IDCOUNT . ' inverter IDs');
-
       // for AGGREGATE, only report if we have seen all inverters
       if (count($total) != IDCOUNT) {
-        report('Expecting IDCOUNT=' . IDCOUNT . ' inverter IDs, seen ' .
+        report('Expecting IDCOUNT=' . IDCOUNT . ' IDs, seen ' .
           count($total) . ' IDs');
-      } elseif ($last < $time - 300 && $min < 5) {
+      } elseif ($last < $time - 540) {
         submit($total, SYSTEMID, APIKEY);
         $last = $time;
       }
@@ -336,93 +393,60 @@ function setup() {
   $ok = socket_bind($socket, '0.0.0.0', 5040);
   if (!$ok) 
     fatal('socket_bind');
-  $ok = socket_listen($socket);
+  // backlog of 1, we do not serve multiple clients
+  $ok = socket_listen($socket, 1);
   if (!$ok)
     fatal('socket_listen');
   return $socket;
 }
 
 /*
- * Loop accepting connections from the gateway
+ * Loop accepting connections from the gatwway
  */
 function loop($socket) {
-  // array used for socket_select, index by string repr of resource
-  $selarray = array('accept' => $socket);
-  // array of Connection instances, index by same
-  $connections = array();
-  $lastclean = time();
-
+  $errcount = 0;
   while (true) {
-    $a = $selarray;
-    $no = null;
-    $err = socket_select($a, $no, $no, 30, 0);
-    if ($err === false) {
-      fatal('socket_select');
+    $client = socket_accept($socket);
+    if (!$client) {
+      report('Socket_accept: ' . socket_strerror(socket_last_error()));
+      if (++$errcount > 100)
+        fatal('Too many socket_accept errors in a row');
+      else
+        continue;
     }
-    while (count($a) > 0) {
-      // process sockets with work pending
-      $s = array_shift($a);
-      // Accepting socket?
-      if ($s == $socket) {
-        $client = socket_accept($socket);
-        if ($client === false) {
-          continue;
-        }
-        $conn = new Connection($client);
-        $selarray[(string)$client] = $client;
-        $connections[(string)$client] = $conn;
-        report('Accepted connection #' . count($connections) .  ' from ' .
-          $conn->toString());
-      } else {
-        // Regular connection socket
-        $conn = $connections[(string)$s];
-        if (!$conn->reader()) {
-          $conn->close();
-          unset($selarray[(string)$s]);
-          unset($connections[(string)$s]);
-        } else {
-          process($conn);
-        }
-      }
-    }
-    // Cleanup stale connections
-    $time = time();
-    if ($lastclean < $time - 30) {
-      $lastclean = time();
-      foreach ($connections as $key =>$conn) {
-        if (!$conn->alive($time)) {
-          report('A connection went dead...');
-          $conn->close();
-          unset($selarray[$key]);
-          unset($connections[$key]);
-        }
-      }
-    }
+    $errcount = 0;
+    if (!socket_set_nonblock($client))
+      fatal('socket_set_nonblock');
+    socket_getpeername($client, $peer);
+    report('Accepted connection from ' . $peer);
+    process($client);
+    socket_close($client);
+    report('Connection closed'); 
   }
 }
 
 if (isset($_SERVER['REQUEST_METHOD'])) {
-  report('only command line', true);
+  report('only command line');
   exit(1);
 }
 
 if (!defined('LIFETIME') || (LIFETIME !== 0 && LIFETIME !== 1)) {
-  report('LIFETIME should be defined to 0 or 1', true);
+  report('LIFETIME should be defined to 0 or 1');
   exit(1);
 }
 if (!defined('EXTENDED') || (EXTENDED !== 0 && EXTENDED !== 1)) {
-  report('EXTENDED should be defined to 0 or 1', true);
+  report('EXTENDED should be defined to 0 or 1');
 }
 if (!defined('MODE') || (MODE != 'SPLIT' && MODE != 'AGGREGATE')) {
-  report('MODE should be \'SPLIT\' or \'AGGREGATE\'', true);
+  report('MODE should be \'SPLIT\' or \'AGGREGATE\'');
   exit(1);
 }
 if (!defined('AC') || (AC !== 0 && AC !== 1)) {
-  report('AC should be defined to 0 or 1', true);
+  report('AC should be defined to 0 or 1');
   exit(1);
 }
 if (MODE == 'SPLIT' && count($systemid) != IDCOUNT) {
-  report('In SPLIT mode, define IDCOUNT systemid mappings', true);
+  report('In SPLIT mode, define IDCOUNT systemid mappings');
   exit(1);
 }
   
@@ -430,53 +454,4 @@ $socket = setup();
 loop($socket);
 socket_close($socket);
 
-/*
- * class for connection maintenance
- */
-class Connection {
-  public $socket;
-  public $buf = '';
-  public $lastkeepalive = 0;
-  public $last_read;
-
-  public function __construct($socket) {
-    $this->socket = $socket;
-    $this->last_read = time();
-  }
- 
-  public function reader() { 
-    $ret = socket_recv($this->socket, $str, 128, 0);
-    if ($ret == false || $ret == 0) {
-      return false;
-    }
-    $this->last_read = time();
-    $this->buf .= $str;
-    return true;
- }
-
-  public function getline() {
-    $pos = strpos($this->buf, "\r");
-    if ($pos === false) {
-      return false;
-    }
-    $str = substr($this->buf, 0, $pos + 1);
-    $this->buf = substr($this->buf, $pos + 2);
-    return $str;
-  }
-
-  public function close() {
-    report('Closed connection from ' . $this->toString());
-    socket_close($this->socket);
-    $this->socket = null;
-  }
-
-  public function toString() {
-    socket_getpeername($this->socket, $peer, $port);
-    return $peer . ':' . $port;
-  }
-
-  public function alive($time) {
-    return $this->last_read > $time - 90;
-  }
-}
 ?>
