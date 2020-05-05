@@ -40,7 +40,7 @@ define('MYSQLDB', 'HomeData');
 define('MYSQLPORT', '3307');
 
 // Optional OpenHab defs, uncomment to enable OpenHab updates
-define('OPENHABHOST', '192.168.143.128');
+define('OPENHABHOST', 'homepi.foardek.vannieuwenhuijze.nl');
 define('OPENHABITEM', 'enecsys_raw_input');
 define('OPENHABPORT', '8088');
 ?>

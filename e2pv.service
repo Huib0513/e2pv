@@ -1,0 +1,15 @@
+[Unit]
+Description=Input van Enecsys (gen 1) micro inverters
+After=multi-user.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+ExecStart=/usr/bin/php /home/pi/enecsys/e2pv/e2pv.php
+StandardOutput=append:/var/log/enecsys/e2pv.log
+StandardError=inherit
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
